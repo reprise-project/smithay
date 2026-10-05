@@ -570,6 +570,14 @@ struct FrameState<B: Buffer, F: Framebuffer> {
     planes: SmallVec<[(plane::Handle, PlaneState<B, F>); 10]>,
 }
 
+impl<B: Buffer, F: Framebuffer> Clone for FrameState<B, F> {
+    fn clone(&self) -> Self {
+        Self {
+            planes: self.planes.clone(),
+        }
+    }
+}
+
 impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
     #[inline]
     fn is_assigned(&self, handle: plane::Handle) -> bool {
@@ -1016,6 +1024,18 @@ where
             .field("kind", &self.kind)
             .finish()
     }
+}
+
+/// The outcome of [`DrmCompositor::reposition_cursor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorMove {
+    /// The cursor plane already is at the element's position; no frame was prepared.
+    Unchanged,
+    /// A frame moving the cursor plane is prepared; queue or commit it.
+    Prepared,
+    /// The previous frame did not scan the element out on a cursor plane as it is now
+    /// (or a reset is pending): `render_frame` is needed.
+    Unavailable,
 }
 
 bitflags::bitflags! {
@@ -2419,6 +2439,95 @@ where
         }
 
         Ok(frame_reference)
+    }
+
+    /// Prepares a frame that only moves the cursor plane to where `element` is now.
+    ///
+    /// This is a fast path for pointer motion over an otherwise unchanged output: it
+    /// skips the element iteration, plane assignment and damage tracking of
+    /// [`render_frame`](DrmCompositor::render_frame). It applies only when the previous
+    /// frame scanned `element` out on a cursor plane with the same image, size, output
+    /// scale and transform, and no reset or modeset is pending. Every other plane keeps
+    /// its state untouched, so the caller must make sure nothing else on the output
+    /// changed since the previous frame; otherwise call `render_frame`.
+    ///
+    /// On [`CursorMove::Prepared`] follow up with [`queue_frame`](DrmCompositor::queue_frame)
+    /// or [`commit_frame`](DrmCompositor::commit_frame) as after `render_frame`.
+    #[profiling::function]
+    pub fn reposition_cursor<E: Element>(&mut self, element: &E) -> CursorMove {
+        if !self.surface.is_active() || self.reset_pending || self.surface.commit_pending() {
+            return CursorMove::Unavailable;
+        }
+        let Some(cursor_state) = self.cursor_state.as_ref() else {
+            return CursorMove::Unavailable;
+        };
+        let Ok((current_size, output_scale, output_transform)) =
+            <(Size<i32, Physical>, Scale<f64>, Transform)>::try_from(&self.output_mode_source)
+        else {
+            return CursorMove::Unavailable;
+        };
+        let output_transform = output_transform.invert();
+        if cursor_state.previous_output_transform != Some(output_transform)
+            || cursor_state.previous_output_scale != Some(output_scale)
+        {
+            return CursorMove::Unavailable;
+        }
+        let output_geometry: Rectangle<_, Physical> =
+            Rectangle::from_size(output_transform.transform_size(current_size));
+
+        let previous_state = self
+            .pending_frame
+            .as_ref()
+            .map(|pending| &pending.frame)
+            .unwrap_or(&self.current_frame);
+        let Some(plane) = self
+            .planes
+            .cursor
+            .iter()
+            .map(|info| info.handle)
+            .find(|handle| previous_state.is_assigned(*handle))
+        else {
+            return CursorMove::Unavailable;
+        };
+        let plane_state = previous_state.plane_state(plane).unwrap();
+        let (Some(element_state), Some(config)) =
+            (plane_state.element_state.as_ref(), plane_state.config.as_ref())
+        else {
+            return CursorMove::Unavailable;
+        };
+        let element_size = output_transform.transform_size(element.geometry(output_scale).size);
+        if element_state.id != *element.id()
+            || element_state.commit != element.current_commit()
+            || element_state.cursor_size != Some(element_size)
+        {
+            return CursorMove::Unavailable;
+        }
+        let cursor_plane_size = config.properties.dst.size;
+        let location = output_transform
+            .transform_point_in(element.location(output_scale), &output_geometry.size)
+            - output_transform.transform_point_in(Point::default(), &cursor_plane_size);
+        if config.properties.dst.loc == location {
+            return CursorMove::Unchanged;
+        }
+
+        // Every plane keeps its state; only the cursor plane's position changes, which
+        // needs no atomic test, as in `try_assign_cursor_plane`.
+        let mut next_frame_state = previous_state.clone();
+        for (_, state) in next_frame_state.planes.iter_mut() {
+            state.skip = true;
+            state.needs_test = false;
+        }
+        let state = next_frame_state.plane_state_mut(plane).unwrap();
+        state.skip = false;
+        state.config.as_mut().unwrap().properties.dst.loc = location;
+
+        // Any next state is reset, putting an acquired slot back to the swapchain.
+        std::mem::drop(self.next_frame.take());
+        self.next_frame = Some(PreparedFrame {
+            kind: PreparedFrameKind::Partial,
+            frame: next_frame_state,
+        });
+        CursorMove::Prepared
     }
 
     /// Queues the current frame for scan-out.
