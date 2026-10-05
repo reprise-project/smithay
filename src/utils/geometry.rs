@@ -1437,32 +1437,25 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
         mut rects: Vec<Self>,
         others: impl IntoIterator<Item = Self>,
     ) -> Vec<Self> {
+        let mut pieces = Vec::new();
         for other in others {
-            let items = rects.len();
-            let mut checked = 0usize;
-            let mut index = 0usize;
-
             // If there is nothing left we can stop,
             // we won't be able to subtract any further
-            if items == 0 {
+            if rects.is_empty() {
                 return rects;
             }
 
-            while checked != items {
-                checked += 1;
-
+            // The pieces left of a rect cut by `other` lie outside it, so
+            // they are kept aside until every rect has been checked.
+            rects.retain(|&item| {
                 // If there is no overlap there is nothing to subtract
-                let Some(intersection) = rects[index].intersection(other) else {
-                    index += 1;
-                    continue;
+                let Some(intersection) = item.intersection(other) else {
+                    return true;
                 };
-
-                // We now know that we have to subtract the other rect
-                let item = rects.swap_remove(index);
 
                 // If we are completely contained then nothing is left
                 if other.contains_rect(item) {
-                    continue;
+                    return false;
                 }
 
                 let top_rect = Rectangle::new(
@@ -1496,22 +1489,14 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
                         .into(),
                 );
 
-                if !top_rect.is_empty() {
-                    rects.push(top_rect);
-                }
-
-                if !left_rect.is_empty() {
-                    rects.push(left_rect);
-                }
-
-                if !right_rect.is_empty() {
-                    rects.push(right_rect);
-                }
-
-                if !bottom_rect.is_empty() {
-                    rects.push(bottom_rect);
-                }
-            }
+                pieces.extend(
+                    [top_rect, left_rect, right_rect, bottom_rect]
+                        .into_iter()
+                        .filter(|r| !r.is_empty()),
+                );
+                false
+            });
+            rects.append(&mut pieces);
         }
 
         rects
@@ -2026,6 +2011,25 @@ impl From<Transform> for WlTransform {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subtract_rects_many_overlapping_self_leaves_nothing() {
+        let rects: Vec<Rectangle<i32, Logical>> = [
+            (420, 438),
+            (36, 54),
+            (564, 582),
+            (540, 558),
+            (516, 534),
+            (492, 510),
+            (468, 486),
+            (444, 462),
+        ]
+        .into_iter()
+        .map(|(x, y)| Rectangle::new((x, y).into(), (786, 432).into()))
+        .collect();
+        let left = Rectangle::subtract_rects_many_in_place(rects.clone(), rects);
+        assert_eq!(left, Vec::new());
+    }
+
     use super::{Logical, Rectangle, Size, Transform};
 
     #[test]
