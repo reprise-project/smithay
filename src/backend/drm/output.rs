@@ -18,7 +18,10 @@ use crate::{
             dmabuf::{AsDmabuf, Dmabuf},
             gbm::GbmDevice,
         },
-        renderer::{Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture, element::RenderElement},
+        renderer::{
+            Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture,
+            element::{Element, RenderElement},
+        },
     },
     output::OutputModeSource,
 };
@@ -26,8 +29,8 @@ use crate::{
 use super::{
     DrmDevice, DrmError, Planes,
     compositor::{
-        DrmCompositor, FrameError, FrameFlags, FrameResult, PrimaryPlaneElement, RenderFrameError,
-        RenderFrameErrorType, RenderFrameResult,
+        CursorMove, DrmCompositor, FrameError, FrameFlags, FrameResult, PrimaryPlaneElement,
+        RenderFrameError, RenderFrameErrorType, RenderFrameResult,
     },
     exporter::ExportFramebuffer,
 };
@@ -705,6 +708,12 @@ where
         self.with_compositor(|compositor| {
             compositor.render_frame(renderer, elements, clear_color, frame_mode)
         })
+    }
+
+    /// Prepares a frame that only moves the cursor plane to where `element` is now,
+    /// see [`DrmCompositor::reposition_cursor`].
+    pub fn reposition_cursor<E: Element>(&mut self, element: &E) -> CursorMove {
+        self.with_compositor(|compositor| compositor.reposition_cursor(element))
     }
 
     /// Queues the current frame for scan-out.
