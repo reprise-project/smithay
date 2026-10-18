@@ -355,6 +355,7 @@ impl<D: XdgToplevelIconHandler> Dispatch2<XdgToplevelIconV1, D> for XdgToplevelI
                         "Request made after the icon has been assigned to a toplevel via 'set_icon'"
                             .to_string(),
                     );
+                    return;
                 }
 
                 self.set_icon_name(icon_name);
@@ -366,6 +367,7 @@ impl<D: XdgToplevelIconHandler> Dispatch2<XdgToplevelIconV1, D> for XdgToplevelI
                         "Request made after the icon has been assigned to a toplevel via 'set_icon'"
                             .to_string(),
                     );
+                    return;
                 }
 
                 let Some(shm) = buffer.data::<ShmBufferUserData>() else {
