@@ -2749,6 +2749,17 @@ where
         self.swapchain.reset_buffer_ages();
     }
 
+    /// Reset the age for all buffers, keeping the buffers frames still hold.
+    ///
+    /// Like [`DrmCompositor::reset_buffer_ages`], but the buffer of the current, pending or
+    /// queued frame is not replaced, so it is reused without a new allocation once released
+    /// (see [`Swapchain::reset_buffer_ages_keep_held`]). Only call this when no frame rendered
+    /// before it will be queued or committed after it: that would mark the frame's buffer as
+    /// holding the previous frame.
+    pub fn reset_buffer_ages_keep_held(&mut self) {
+        self.swapchain.reset_buffer_ages_keep_held();
+    }
+
     /// Returns the underlying [`crtc`] of this surface
     pub fn crtc(&self) -> crtc::Handle {
         self.surface.crtc()
