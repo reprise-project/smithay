@@ -251,6 +251,20 @@ where
         }
     }
 
+    /// Reset the age for each buffer, keeping buffers that are still held.
+    ///
+    /// Like [`Swapchain::reset_buffer_ages`] this forces a full redraw for the next frame, but a
+    /// slot still held elsewhere (e.g. the buffer being scanned out) keeps its buffer instead of
+    /// being replaced, so it is reused without a new allocation once released.
+    ///
+    /// The caller must not call [`Swapchain::submitted`] on a buffer it held across this reset:
+    /// that would mark the slot as holding the previous frame while it holds pre-reset content.
+    pub fn reset_buffer_ages_keep_held(&mut self) {
+        for slot in &self.slots {
+            slot.age.store(0, Ordering::SeqCst);
+        }
+    }
+
     /// Get set format
     pub fn format(&self) -> Fourcc {
         self.fourcc
@@ -259,5 +273,92 @@ where
     /// Get allowed modifiers
     pub fn modifiers(&self) -> &[Modifier] {
         &self.modifiers
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::allocator::Format;
+    use crate::utils::{Buffer as BufferCoords, Size};
+    use std::sync::atomic::AtomicUsize;
+
+    struct TestBuffer;
+
+    impl Buffer for TestBuffer {
+        fn size(&self) -> Size<i32, BufferCoords> {
+            (4, 4).into()
+        }
+
+        fn format(&self) -> Format {
+            Format {
+                code: Fourcc::Argb8888,
+                modifier: Modifier::Linear,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingAllocator(Arc<AtomicUsize>);
+
+    impl Allocator for CountingAllocator {
+        type Buffer = TestBuffer;
+        type Error = std::io::Error;
+
+        fn create_buffer(
+            &mut self,
+            _width: u32,
+            _height: u32,
+            _fourcc: Fourcc,
+            _modifiers: &[Modifier],
+        ) -> Result<TestBuffer, std::io::Error> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(TestBuffer)
+        }
+    }
+
+    /// A swapchain with two submitted buffers: `shown` still held, the other one released.
+    fn one_held() -> (Swapchain<CountingAllocator>, Slot<TestBuffer>, Arc<AtomicUsize>) {
+        let allocator = CountingAllocator::default();
+        let created = allocator.0.clone();
+        let mut swapchain = Swapchain::new(allocator, 4, 4, Fourcc::Argb8888, vec![Modifier::Linear]);
+        let shown = swapchain.acquire().unwrap().unwrap();
+        swapchain.submitted(&shown);
+        let free = swapchain.acquire().unwrap().unwrap();
+        swapchain.submitted(&free);
+        drop(free);
+        assert_eq!(created.load(Ordering::SeqCst), 2);
+        (swapchain, shown, created)
+    }
+
+    #[test]
+    fn reset_buffer_ages_keep_held_reuses_held_buffers() {
+        let (mut swapchain, shown, created) = one_held();
+
+        swapchain.reset_buffer_ages_keep_held();
+        assert_eq!(shown.age(), 0, "a held buffer's age is reset");
+        let next = swapchain.acquire().unwrap().unwrap();
+        assert_eq!(next.age(), 0, "a free buffer's age is reset");
+        drop(shown);
+        let after = swapchain.acquire().unwrap().unwrap();
+        assert_eq!(after.age(), 0);
+        assert_eq!(created.load(Ordering::SeqCst), 2, "no buffer was reallocated");
+    }
+
+    #[test]
+    fn reset_buffer_ages_replaces_held_buffers() {
+        let (mut swapchain, shown, created) = one_held();
+
+        swapchain.reset_buffer_ages();
+        let next = swapchain.acquire().unwrap().unwrap();
+        assert_eq!(next.age(), 0, "a free buffer's age is reset");
+        drop(shown);
+        let after = swapchain.acquire().unwrap().unwrap();
+        assert_eq!(after.age(), 0);
+        assert_eq!(
+            created.load(Ordering::SeqCst),
+            3,
+            "the held buffer's slot was replaced"
+        );
     }
 }
