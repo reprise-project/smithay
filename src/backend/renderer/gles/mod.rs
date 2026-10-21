@@ -2548,12 +2548,49 @@ impl Frame for GlesFrame<'_, '_> {
 }
 
 impl GlesFrame<'_, '_> {
+    /// Finishes the frame like [`Frame::finish`], without flushing, without a [`SyncPoint`] and
+    /// without a write fence on a texture target.
+    ///
+    /// Only for a target that is read later by this renderer's own context, as commands of one
+    /// context run in order. A target read from another context or thread, exported, or scanned
+    /// out needs [`Frame::finish`]: nothing would flush these commands or signal their end.
+    /// The write fence is left out because a reader in this context needs none, and waiting on a
+    /// fence that was never flushed makes drivers such as iris flush at the reader.
+    #[profiling::function]
+    pub fn finish_unsynced(mut self) -> Result<(), GlesError> {
+        self.end_frame(false).map(|_| ())
+    }
+
     #[profiling::function]
     fn finish_internal(&mut self) -> Result<SyncPoint, GlesError> {
+        if !self.end_frame(true)? {
+            return Ok(SyncPoint::signaled());
+        }
+        let _guard = self.span.enter();
+
+        // if we support egl fences we should use it
+        if let Some(sync_point) = self.renderer.export_sync_point() {
+            // Sync after glFlush in export_sync_point() and right before returning.
+            self.renderer.profiler.sync_gpu(&self.renderer.gl);
+            return Ok(sync_point);
+        }
+
+        self.renderer.profiler.sync_gpu(&self.renderer.gl);
+
+        // as a last option we force finish, this is unlikely to happen
+        unsafe {
+            self.renderer.gl.Finish();
+        }
+        Ok(SyncPoint::signaled())
+    }
+
+    /// Resets the frame's GL state, without flushing; `write_fence` fences a texture target's
+    /// write for other contexts. Returns `false` if the frame was already finished.
+    fn end_frame(&mut self, write_fence: bool) -> Result<bool, GlesError> {
         let _guard = self.span.enter();
 
         if self.finished.swap(true, Ordering::SeqCst) {
-            return Ok(SyncPoint::signaled());
+            return Ok(false);
         }
 
         let finish_gpu_span = self
@@ -2565,8 +2602,10 @@ impl GlesFrame<'_, '_> {
             self.renderer.gl.Disable(ffi::BLEND);
         }
 
-        if let GlesTargetInternal::Texture { sync_lock, .. } = &mut self.target.0 {
-            sync_lock.update_write(&self.renderer.gl);
+        if write_fence {
+            if let GlesTargetInternal::Texture { sync_lock, .. } = &mut self.target.0 {
+                sync_lock.update_write(&self.renderer.gl);
+            }
         }
 
         // delayed destruction until the next frame rendering.
@@ -2583,21 +2622,7 @@ impl GlesFrame<'_, '_> {
         if let Some(span) = self.gpu_span.take() {
             self.renderer.profiler.exit(&self.renderer.gl, span);
         }
-
-        // if we support egl fences we should use it
-        if let Some(sync_point) = self.renderer.export_sync_point() {
-            // Sync after glFlush in export_sync_point() and right before returning.
-            self.renderer.profiler.sync_gpu(&self.renderer.gl);
-            return Ok(sync_point);
-        }
-
-        self.renderer.profiler.sync_gpu(&self.renderer.gl);
-
-        // as a last option we force finish, this is unlikely to happen
-        unsafe {
-            self.renderer.gl.Finish();
-        }
-        Ok(SyncPoint::signaled())
+        Ok(true)
     }
 
     /// Overrides the default texture shader used, if none is specified.
@@ -3624,7 +3649,7 @@ mod context_activation_tests {
 
     // Prefer software rendering so the tests can run without a GPU: Mesa offers a software
     // device even on a machine with no DRM node.
-    fn test_renderer() -> GlesRenderer {
+    pub(super) fn test_renderer() -> GlesRenderer {
         let mut devices = EGLDevice::enumerate()
             .expect("EGL device enumeration failed; Mesa provides the software device these tests need")
             .collect::<Vec<_>>();
@@ -3670,5 +3695,92 @@ mod context_activation_tests {
 
         unsafe { renderer.egl_context().make_current().unwrap() };
         assert_eq!(unsafe { renderer.gl.IsTexture(texture_id) }, ffi::FALSE);
+    }
+}
+
+#[cfg(test)]
+mod finish_unsynced_tests {
+    use super::context_activation_tests::test_renderer;
+    use super::*;
+    use crate::backend::renderer::{Bind, ExportMem, FrameContext, Offscreen};
+
+    const W: i32 = 4;
+    const GREEN: Color32F = Color32F::new(0.0, 1.0, 0.0, 1.0);
+
+    fn size() -> Size<i32, Physical> {
+        (W, W).into()
+    }
+
+    fn texture(renderer: &mut GlesRenderer) -> GlesTexture {
+        renderer
+            .create_buffer(Fourcc::Abgr8888, Size::from((W, W)))
+            .unwrap()
+    }
+
+    fn pixels(renderer: &mut GlesRenderer, texture: &GlesTexture) -> Vec<u8> {
+        let mapping = renderer
+            .copy_texture(texture, Rectangle::from_size((W, W).into()), Fourcc::Abgr8888)
+            .unwrap();
+        renderer.map_texture(&mapping).unwrap().to_vec()
+    }
+
+    fn all_green(pixels: &[u8]) -> bool {
+        pixels.len() == (W * W * 4) as usize && pixels.chunks(4).all(|p| p == [0, 255, 0, 255])
+    }
+
+    #[test]
+    fn finish_unsynced_target_reads_back_in_the_same_context() {
+        let mut renderer = test_renderer();
+        let mut tex = texture(&mut renderer);
+        {
+            let mut target = renderer.bind(&mut tex).unwrap();
+            let mut frame = renderer.render(&mut target, size(), Transform::Normal).unwrap();
+            frame.clear(GREEN, &[Rectangle::from_size(size())]).unwrap();
+            frame.finish_unsynced().unwrap();
+        }
+
+        assert_eq!(unsafe { renderer.gl.IsEnabled(ffi::SCISSOR_TEST) }, ffi::FALSE);
+        assert_eq!(unsafe { renderer.gl.IsEnabled(ffi::BLEND) }, ffi::FALSE);
+        assert!(all_green(&pixels(&mut renderer, &tex)));
+    }
+
+    #[test]
+    fn nested_finish_unsynced_target_draws_into_the_outer_frame() {
+        let mut renderer = test_renderer();
+        let mut inner = texture(&mut renderer);
+        let mut outer = texture(&mut renderer);
+        {
+            let mut outer_target = renderer.bind(&mut outer).unwrap();
+            let mut frame = renderer
+                .render(&mut outer_target, size(), Transform::Normal)
+                .unwrap();
+            frame
+                .clear(Color32F::new(1.0, 0.0, 0.0, 1.0), &[Rectangle::from_size(size())])
+                .unwrap();
+            {
+                let mut guard = frame.renderer();
+                let renderer = guard.as_mut();
+                let mut target = renderer.bind(&mut inner).unwrap();
+                let mut nested = renderer.render(&mut target, size(), Transform::Normal).unwrap();
+                nested.clear(GREEN, &[Rectangle::from_size(size())]).unwrap();
+                nested.finish_unsynced().unwrap();
+            }
+            let damage = [Rectangle::from_size(size())];
+            frame
+                .render_texture_at(
+                    &inner,
+                    (0, 0).into(),
+                    1,
+                    1.0,
+                    Transform::Normal,
+                    &damage,
+                    &[],
+                    1.0,
+                )
+                .unwrap();
+            let _ = frame.finish().unwrap();
+        }
+
+        assert!(all_green(&pixels(&mut renderer, &outer)));
     }
 }
