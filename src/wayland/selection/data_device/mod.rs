@@ -722,6 +722,24 @@ where
     }
 }
 
+/// Whether the seat holds a clipboard selection, a client's or one set by the compositor
+///
+/// A client's selection ends without a [`SelectionHandler::new_selection`] call
+/// when its source is destroyed, so this is how a compositor learns it is gone.
+#[instrument(name = "wayland_data_device", level = "debug", skip_all, fields(seat = seat.name()))]
+pub fn data_device_selection_alive<D>(seat: &Seat<D>) -> bool
+where
+    D: SeatHandler + DataDeviceHandler + 'static,
+{
+    seat.user_data()
+        .insert_if_missing(|| RefCell::new(SeatData::<D::SelectionUserData>::new()));
+    let seat_data = seat
+        .user_data()
+        .get::<RefCell<SeatData<D::SelectionUserData>>>()
+        .unwrap();
+    seat_data.borrow().get_clipboard_selection().is_some()
+}
+
 /// Gets the user_data for the currently active selection, if set by the compositor
 #[instrument(name = "wayland_data_device", level = "debug", skip_all, fields(seat = seat.name()))]
 pub fn current_data_device_selection_userdata<D>(seat: &Seat<D>) -> Option<Ref<'_, D::SelectionUserData>>
