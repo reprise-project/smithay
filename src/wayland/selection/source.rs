@@ -3,7 +3,7 @@ use std::os::unix::io::{AsFd, OwnedFd};
 use wayland_protocols::ext::data_control::v1::server::ext_data_control_source_v1::ExtDataControlSourceV1;
 use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1 as PrimarySource;
 use wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_source_v1::ZwlrDataControlSourceV1;
-use wayland_server::{Resource, protocol::wl_data_source::WlDataSource};
+use wayland_server::{Client, Resource, protocol::wl_data_source::WlDataSource};
 
 use crate::wayland::selection::primary_selection::PrimarySourceUserData;
 
@@ -24,6 +24,12 @@ impl SelectionSource {
     /// Mime types associated with the source.
     pub fn mime_types(&self) -> Vec<String> {
         self.provider.mime_types()
+    }
+
+    /// The client that offered the source, or `None` once that client has disconnected.
+    pub fn client(&self) -> Option<Client> {
+        let provider = &self.provider;
+        selection_dispatch!(provider; SelectionSourceProvider(source) => source.client())
     }
 }
 
