@@ -175,6 +175,7 @@ use x11rb::{
         composite::{ConnectionExt as _, Redirect},
         randr::{ConnectionExt as _, Notify, NotifyMask},
         render::{ConnectionExt as _, CreatePictureAux, PictureWrapper},
+        res::{ClientIdMask, ClientIdSpec, query_client_ids},
         sync::{ConnectionExt as _, Counter},
         xfixes::ConnectionExt as _,
         xproto::{
@@ -1068,6 +1069,34 @@ impl X11Wm {
     /// Id of this X11 WM
     pub fn id(&self) -> XwmId {
         self.id
+    }
+
+    /// The pid, by the X-Resource extension, of the X client holding the client slot of the window
+    /// named as the owner of `selection`, as of the last XFixes event Xwm processed. The owning
+    /// client names any window it likes, so this doesn't tell which client owns it. Blocks on a
+    /// round trip to the X server.
+    ///
+    /// `None` while nobody or Xwm's selection window owns it, or when the server can't tell, e.g.
+    /// for a client connected over TCP. Xwm's other windows give the compositor's own pid.
+    pub fn selection_owner_pid(&self, selection: SelectionTarget) -> Option<u32> {
+        let selection = match selection {
+            SelectionTarget::Clipboard => &self.clipboard,
+            SelectionTarget::Primary => &self.primary,
+        };
+        if selection.owner == x11rb::NONE || selection.owner == *selection.window {
+            return None;
+        }
+        let spec = ClientIdSpec {
+            client: selection.owner,
+            mask: ClientIdMask::LOCAL_CLIENT_PID,
+        };
+        let reply = query_client_ids(&*self.conn, &[spec]).ok()?.reply().ok()?;
+        reply
+            .ids
+            .iter()
+            .find(|id| id.spec.mask.contains(ClientIdMask::LOCAL_CLIENT_PID))
+            .and_then(|id| id.value.first().copied())
+            .filter(|&pid| pid != 0)
     }
 
     /// Whether or not the XSYNC extension is present
