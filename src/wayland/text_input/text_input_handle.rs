@@ -288,8 +288,9 @@ where
                 pending_state.content_type = Some((hint, purpose));
             }
             zwp_text_input_v3::Request::SetCursorRectangle { x, y, width, height } => {
-                pending_state.cursor_rectangle =
-                    (width > 0 && height > 0).then(|| Rectangle::new((x, y).into(), (width, height).into()));
+                // A caret is usually zero wide (GTK sends width 0), so only a negative size is dropped.
+                pending_state.cursor_rectangle = (width >= 0 && height >= 0)
+                    .then(|| Rectangle::new((x, y).into(), (width, height).into()));
             }
             zwp_text_input_v3::Request::Commit => {
                 let mut new_state = mem::take(pending_state);
