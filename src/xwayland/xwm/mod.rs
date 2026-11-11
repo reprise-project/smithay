@@ -1054,9 +1054,13 @@ impl X11Wm {
         handle.insert_source(source, move |event, _, data| match event {
             calloop::channel::Event::Msg(event) => {
                 if let Some(event_handle) = event_handle.upgrade() {
+                    let conn = Arc::clone(&data.xwm_state(id).conn);
                     if let Err(err) = handle_event(&event_handle, &dh, data, id, event) {
                         warn!(id = id.0, err = ?err, "Failed to handle X11 event");
                     }
+                    // Requests a handler queued must not wait in the buffer for the next flush:
+                    // a stale one can reach the server after a newer client request.
+                    let _ = conn.flush();
                 }
             }
             calloop::channel::Event::Closed => {
@@ -1338,6 +1342,9 @@ impl X11Wm {
             self.conn
                 .set_selection_owner(x11rb::NONE, selection.atom, selection.timestamp)?;
         }
+        // Unflushed, the CURRENT_TIME claim can reach the server after an X client's later take
+        // and steal the selection back from it.
+        self.conn.flush()?;
 
         Ok(())
     }
