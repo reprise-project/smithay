@@ -312,18 +312,18 @@ impl MemoryRenderBufferInner {
         let context_id = renderer.context_id().erased();
         let current_commit = self.damage_bag.current_commit();
         let last_commit = self.renderer_seen.get(&context_id).copied();
-        let buffer_damage = self
-            .damage_bag
-            .damage_since(last_commit)
-            .map(|d| d.into_iter().reduce(|a, b| a.merge(b)).unwrap_or_default())
-            .unwrap_or_else(|| Rectangle::from_size(self.mem.size()));
+        let size = self.mem.size();
+        let uploads = match self.damage_bag.damage_since(last_commit) {
+            Some(damage) => upload_rects(damage, size),
+            None => vec![Rectangle::from_size(size)],
+        };
 
         let tex = match self.textures.entry(context_id.clone()) {
             Entry::Occupied(entry) => {
                 let tex = entry.get().downcast_ref().unwrap();
-                if !buffer_damage.is_empty() {
-                    trace!("updating memory with damage {:#?}", &buffer_damage);
-                    renderer.update_memory(tex, &self.mem, buffer_damage)?
+                for rect in uploads {
+                    trace!("updating memory with damage {:#?}", &rect);
+                    renderer.update_memory(tex, &self.mem, rect)?
                 }
                 tex.clone()
             }
@@ -337,6 +337,56 @@ impl MemoryRenderBufferInner {
 
         self.renderer_seen.insert(context_id, current_commit);
         Ok(tex)
+    }
+}
+
+/// Pixels a separate `update_memory` call is worth: two rects whose bounding box adds no more
+/// than this are uploaded as the box.
+const UPLOAD_CALL_PIXELS: i64 = 64 * 64;
+/// Most `update_memory` calls per import.
+const MAX_UPLOADS: usize = 8;
+/// Longer damage lists are uploaded as their bounding box without planning.
+const MAX_PLANNED_RECTS: usize = 64;
+
+fn area(rect: Rectangle<i32, Buffer>) -> i64 {
+    rect.size.w as i64 * rect.size.h as i64
+}
+
+/// The rects to upload for `damage`, clipped to a buffer of `size`.
+///
+/// The pair whose bounding box adds the fewest pixels over uploading both apart merges first,
+/// while that is at most [`UPLOAD_CALL_PIXELS`] or more than [`MAX_UPLOADS`] rects remain.
+fn upload_rects(
+    damage: impl IntoIterator<Item = Rectangle<i32, Buffer>>,
+    size: Size<i32, Buffer>,
+) -> Vec<Rectangle<i32, Buffer>> {
+    let bounds = Rectangle::from_size(size);
+    let mut rects = damage
+        .into_iter()
+        .filter_map(|rect| rect.intersection(bounds))
+        .filter(|rect| !rect.is_empty())
+        .collect::<Vec<_>>();
+    if rects.len() > MAX_PLANNED_RECTS {
+        return rects.into_iter().reduce(|a, b| a.merge(b)).into_iter().collect();
+    }
+
+    loop {
+        let mut cheapest: Option<(i64, usize, usize)> = None;
+        for i in 0..rects.len() {
+            for j in i + 1..rects.len() {
+                let added = area(rects[i].merge(rects[j])) - area(rects[i]) - area(rects[j]);
+                if cheapest.is_none_or(|(least, _, _)| added < least) {
+                    cheapest = Some((added, i, j));
+                }
+            }
+        }
+        match cheapest {
+            Some((added, i, j)) if added <= UPLOAD_CALL_PIXELS || rects.len() > MAX_UPLOADS => {
+                let other = rects.swap_remove(j);
+                rects[i] = rects[i].merge(other);
+            }
+            _ => return rects,
+        }
     }
 }
 
@@ -658,5 +708,122 @@ where
     #[inline]
     fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         Some(UnderlyingStorage::Memory(&self.buffer))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Buffer> {
+        Rectangle::new((x, y).into(), (w, h).into())
+    }
+
+    fn plan(damage: &[Rectangle<i32, Buffer>]) -> Vec<Rectangle<i32, Buffer>> {
+        let mut rects = upload_rects(damage.iter().copied(), (1000, 1000).into());
+        rects.sort_by_key(|r| (r.loc.y, r.loc.x));
+        rects
+    }
+
+    #[test]
+    fn far_rects_upload_apart() {
+        let field = rect(400, 300, 200, 20);
+        let message = rect(100, 800, 600, 40);
+        assert_eq!(plan(&[message, field]), vec![field, message]);
+    }
+
+    #[test]
+    fn overlapping_touching_and_near_rects_upload_as_their_box() {
+        assert_eq!(
+            plan(&[rect(0, 0, 50, 50), rect(50, 0, 50, 50)]),
+            vec![rect(0, 0, 100, 50)]
+        );
+        assert_eq!(
+            plan(&[rect(0, 0, 500, 500), rect(100, 100, 10, 10)]),
+            vec![rect(0, 0, 500, 500)]
+        );
+        assert_eq!(
+            plan(&[rect(0, 0, 60, 60), rect(30, 30, 60, 60)]),
+            vec![rect(0, 0, 90, 90)]
+        );
+        // The box adds 100x40 = 4000 pixels, under one call's worth.
+        assert_eq!(
+            plan(&[rect(0, 0, 100, 10), rect(0, 50, 100, 10)]),
+            vec![rect(0, 0, 100, 60)]
+        );
+        // The box adds 100x41 = 4100 pixels.
+        assert_eq!(
+            plan(&[rect(0, 0, 100, 10), rect(0, 51, 100, 10)]),
+            vec![rect(0, 0, 100, 10), rect(0, 51, 100, 10)]
+        );
+    }
+
+    #[test]
+    fn rects_past_the_cap_merge_into_boxes_that_cover_them() {
+        let damage = (0..20)
+            .map(|i| rect((i % 5) * 200, (i / 5) * 250, 40, 40))
+            .collect::<Vec<_>>();
+        let rects = plan(&damage);
+        assert_eq!(rects.len(), MAX_UPLOADS);
+        assert!(damage.iter().all(|d| rects.iter().any(|r| r.contains_rect(*d))));
+    }
+
+    #[test]
+    fn damage_is_clipped_to_the_buffer() {
+        assert_eq!(
+            plan(&[rect(-10, 990, 30, 30), rect(2000, 0, 10, 10), rect(5, 5, 0, 0)]),
+            vec![rect(0, 990, 20, 10)]
+        );
+    }
+
+    #[cfg(feature = "renderer_gl")]
+    #[test]
+    fn import_uploads_far_damage_apart_and_skips_the_gap() {
+        use crate::backend::renderer::{ExportMem, gles::context_activation_tests::test_renderer};
+
+        const W: i32 = 256;
+        let mut renderer = test_renderer();
+        let mut buffer = MemoryRenderBuffer::new(Fourcc::Abgr8888, (W, W), 1, Transform::Normal, None);
+        let first = MemoryRenderBufferRenderElement::from_buffer(
+            &mut renderer,
+            (0.0, 0.0),
+            &buffer,
+            None,
+            None,
+            None,
+            Kind::Unspecified,
+        )
+        .unwrap();
+
+        // Every pixel changes, but only two far corners are reported.
+        buffer
+            .render()
+            .draw(|mem| {
+                mem.fill(255);
+                Ok::<_, ()>(vec![rect(0, 0, 16, 16), rect(W - 16, W - 16, 16, 16)])
+            })
+            .unwrap();
+        let second = MemoryRenderBufferRenderElement::from_buffer(
+            &mut renderer,
+            (0.0, 0.0),
+            &buffer,
+            None,
+            None,
+            None,
+            Kind::Unspecified,
+        )
+        .unwrap();
+        assert_eq!(first.texture.tex_id(), second.texture.tex_id());
+
+        let mapping = renderer
+            .copy_texture(&second.texture, rect(0, 0, W, W), Fourcc::Abgr8888)
+            .unwrap();
+        let pixels = renderer.map_texture(&mapping).unwrap();
+        let at = |x: i32, y: i32| pixels[((y * W + x) * 4) as usize];
+        assert_eq!(
+            [at(0, 0), at(15, 15), at(W - 16, W - 16), at(W - 1, W - 1)],
+            [255; 4]
+        );
+        assert_eq!([at(16, 16), at(W / 2, W / 2), at(W - 17, W - 17)], [0; 3]);
     }
 }

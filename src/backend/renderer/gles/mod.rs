@@ -3643,13 +3643,13 @@ mod tests {
 }
 
 #[cfg(test)]
-mod context_activation_tests {
+pub(crate) mod context_activation_tests {
     use super::*;
     use crate::backend::egl::EGLDisplay;
 
     // Prefer software rendering so the tests can run without a GPU: Mesa offers a software
     // device even on a machine with no DRM node.
-    pub(super) fn test_renderer() -> GlesRenderer {
+    pub(crate) fn test_renderer() -> GlesRenderer {
         let mut devices = EGLDevice::enumerate()
             .expect("EGL device enumeration failed; Mesa provides the software device these tests need")
             .collect::<Vec<_>>();
