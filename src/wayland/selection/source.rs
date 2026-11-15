@@ -31,6 +31,14 @@ impl SelectionSource {
         let provider = &self.provider;
         selection_dispatch!(provider; SelectionSourceProvider(source) => source.client())
     }
+
+    /// Change the mime types the source is offered as, such as to add a type the compositor
+    /// vouches for. Called from [`SelectionHandler::new_selection`](super::SelectionHandler::new_selection),
+    /// the change reaches every offer made for the new selection. A client asked for a type it
+    /// never offered may answer nothing.
+    pub fn edit_mime_types(&self, f: impl FnOnce(&mut Vec<String>)) {
+        self.provider.edit_mime_types(f)
+    }
 }
 
 /// Provider of the selection data.
@@ -75,6 +83,28 @@ impl SelectionSourceProvider {
             Self::ExtDataControl(source) => {
                 let data: &ExtDataControlSourceUserData = source.data().unwrap();
                 data.inner.lock().unwrap().mime_types.contains(mime_type)
+            }
+        }
+    }
+
+    /// Change the mime types associated with the given source.
+    pub fn edit_mime_types(&self, f: impl FnOnce(&mut Vec<String>)) {
+        match self {
+            Self::DataDevice(source) => {
+                let data: &DataSourceUserData = source.data().unwrap();
+                f(&mut data.inner.lock().unwrap().mime_types)
+            }
+            Self::Primary(source) => {
+                let data: &PrimarySourceUserData = source.data().unwrap();
+                f(&mut data.inner.lock().unwrap().mime_types)
+            }
+            Self::WlrDataControl(source) => {
+                let data: &DataControlSourceUserData = source.data().unwrap();
+                f(&mut data.inner.lock().unwrap().mime_types)
+            }
+            Self::ExtDataControl(source) => {
+                let data: &ExtDataControlSourceUserData = source.data().unwrap();
+                f(&mut data.inner.lock().unwrap().mime_types)
             }
         }
     }
