@@ -284,12 +284,13 @@ where
                     return;
                 };
 
-                let tv_sec = ((tv_sec_hi as u64) << 32) | tv_sec_lo as u64;
-
-                let timestamp = Timestamp(Timespec {
-                    tv_sec: tv_sec as rustix::time::Secs,
-                    tv_nsec: tv_nsec as rustix::time::Nsecs,
-                });
+                let Some(timestamp) = Timestamp::from_parts(tv_sec_hi, tv_sec_lo, tv_nsec) else {
+                    resource.post_error(
+                        wp_commit_timer_v1::Error::InvalidTimestamp,
+                        "the timestamp is not a valid non-negative timespec",
+                    );
+                    return;
+                };
 
                 let already_has_timestamp = with_states(&surface, move |states| {
                     let mut commit_timer_state = states
@@ -332,6 +333,21 @@ where
 /// Timestamp set through [`wp_commit_timer_v1::Request::SetTimestamp`] for a surface
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct Timestamp(Timespec);
+
+impl Timestamp {
+    /// The timestamp `set_timestamp` sends, or `None` when `tv_sec` does not fit a
+    /// non-negative `time_t` or `tv_nsec` is 1e9 or more.
+    fn from_parts(tv_sec_hi: u32, tv_sec_lo: u32, tv_nsec: u32) -> Option<Self> {
+        let tv_sec = ((tv_sec_hi as u64) << 32) | tv_sec_lo as u64;
+        if tv_nsec >= 1_000_000_000 {
+            return None;
+        }
+        Some(Self(Timespec {
+            tv_sec: rustix::time::Secs::try_from(tv_sec).ok()?,
+            tv_nsec: tv_nsec as rustix::time::Nsecs,
+        }))
+    }
+}
 
 impl Ord for Timestamp {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -437,5 +453,19 @@ impl std::cmp::PartialOrd for CommitTimerBarrier {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Timestamp;
+
+    #[test]
+    fn timestamps_out_of_range_are_invalid() {
+        assert!(Timestamp::from_parts(0, 12, 999_999_999).is_some());
+        assert!(Timestamp::from_parts(0x7fff_ffff, u32::MAX, 0).is_some());
+        assert!(Timestamp::from_parts(0, 12, 1_000_000_000).is_none());
+        assert!(Timestamp::from_parts(0x8000_0000, 0, 0).is_none());
+        assert!(Timestamp::from_parts(u32::MAX, u32::MAX, u32::MAX).is_none());
     }
 }
