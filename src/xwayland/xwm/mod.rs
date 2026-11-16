@@ -193,6 +193,15 @@ use x11rb::{
 mod dnd;
 mod mwm;
 pub use self::mwm::*;
+
+/// Why an X client's selection went away, see [`XwmHandler::selection_gone`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionGone {
+    /// The owner set the selection to no window.
+    Cleared,
+    /// The owner's window was destroyed or its client disconnected.
+    OwnerGone,
+}
 pub mod settings;
 use settings::{NameError, Value, XSettings};
 mod selection;
@@ -566,6 +575,15 @@ pub trait XwmHandler {
     /// A proviously set selection of an X client got cleared
     fn cleared_selection(&mut self, xwm: XwmId, selection: SelectionTarget) {
         let _ = (xwm, selection);
+    }
+
+    /// A previously set selection of an X client went away, and why.
+    ///
+    /// Calls [`XwmHandler::cleared_selection`] by default. A compositor that keeps a copy of a
+    /// selection whose owner quit can tell that case from an explicit clear here.
+    fn selection_gone(&mut self, xwm: XwmId, selection: SelectionTarget, reason: SelectionGone) {
+        let _ = reason;
+        self.cleared_selection(xwm, selection);
     }
 
     /// The primary output of the randr protocol state was updated
@@ -2002,8 +2020,12 @@ where
             if n.owner == x11rb::NONE && selection.owner != *selection.window {
                 // A real X clients selection went away, not our proxy
                 let selection = selection.type_().unwrap();
+                let reason = match n.subtype {
+                    x11rb::protocol::xfixes::SelectionEvent::SET_SELECTION_OWNER => SelectionGone::Cleared,
+                    _ => SelectionGone::OwnerGone,
+                };
                 drop(_guard);
-                state.cleared_selection(xwm_id, selection);
+                state.selection_gone(xwm_id, selection, reason);
                 return Ok(());
             }
 
