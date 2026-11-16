@@ -105,6 +105,10 @@ const DEFAULT_SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 //   of frames at 60fps."
 const SYNC_REQUEST_INCREMENT: i64 = 240;
 
+/// The most `_NET_WM_OPAQUE_REGION` CARDINALs read (four per rectangle). The property is read
+/// synchronously on the compositor's thread, so a client can't make it read more than this.
+const MAX_OPAQUE_REGION_LEN: u32 = 4096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SyncRequestCounter {
     Basic(Counter),
@@ -2503,10 +2507,19 @@ fn fetch_opaque_regions(
     client_scale: Option<&Arc<AtomicF64>>,
 ) -> Result<Option<RegionAttributes>, ConnectionError> {
     let reply = conn
-        .get_property(false, window, property_atom, AtomEnum::CARDINAL, 0, u32::MAX)?
+        .get_property(
+            false,
+            window,
+            property_atom,
+            AtomEnum::CARDINAL,
+            0,
+            MAX_OPAQUE_REGION_LEN,
+        )?
         .reply_unchecked()?;
 
+    // A region longer than the cap counts as none: no part of the window is taken as opaque.
     let opaque_region = reply
+        .filter(|reply| reply.bytes_after == 0)
         .and_then(|reply| {
             reply.value32().map(|values| {
                 let client_scale = client_scale
