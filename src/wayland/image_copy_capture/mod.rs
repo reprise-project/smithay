@@ -633,6 +633,27 @@ impl FrameInner {
     }
 }
 
+/// Rectangles a frame keeps from `damage_buffer`.
+const MAX_DAMAGE_RECTS: usize = 32;
+
+/// Adds a `damage_buffer` rect cut to the buffer. Past [`MAX_DAMAGE_RECTS`] the frame's damage
+/// becomes the bounds of everything sent, so a flood of rects costs no memory and loses no damage.
+fn add_damage(
+    damage: &mut Vec<Rectangle<i32, BufferCoords>>,
+    rect: Rectangle<i32, BufferCoords>,
+    buffer: Size<i32, BufferCoords>,
+) {
+    let Some(rect) = rect.intersection(Rectangle::from_size(buffer)) else {
+        return;
+    };
+    if damage.len() < MAX_DAMAGE_RECTS {
+        damage.push(rect);
+    } else {
+        let bounds = damage.drain(..).fold(rect, Rectangle::merge);
+        damage.push(bounds);
+    }
+}
+
 /// A cloneable reference to a capture frame.
 ///
 /// Used for tracking the active frame within a session.
@@ -664,7 +685,9 @@ impl FrameRef {
             .expect("no buffer attached")
     }
 
-    /// Get the damage regions for this frame.
+    /// Get the damage regions the client sent for this frame, cut to the buffer.
+    ///
+    /// A frame sent many regions gets one rectangle bounding them.
     pub fn damage(&self) -> Vec<Rectangle<i32, BufferCoords>> {
         self.inner.lock().unwrap().damage.clone()
     }
@@ -1293,10 +1316,14 @@ where
                 if x < 0 || y < 0 || width <= 0 || height <= 0 {
                     return;
                 }
-                inner.damage.push(Rectangle {
-                    loc: (x, y).into(),
-                    size: (width, height).into(),
-                });
+                let Some(size) = inner.constraints.as_ref().map(|c| c.size) else {
+                    return;
+                };
+                add_damage(
+                    &mut inner.damage,
+                    Rectangle::new((x, y).into(), (width, height).into()),
+                    size,
+                );
             }
             ext_image_copy_capture_frame_v1::Request::Capture => {
                 let frame_ref = FrameRef {
@@ -1405,5 +1432,52 @@ where
         }
 
         state.frame_aborted(frame_ref);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_DAMAGE_RECTS, add_damage};
+    use crate::utils::{Buffer, Rectangle};
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Buffer> {
+        Rectangle::new((x, y).into(), (w, h).into())
+    }
+
+    #[test]
+    fn damage_is_cut_to_the_buffer() {
+        let mut damage = Vec::new();
+        add_damage(&mut damage, rect(10, 20, 30, 40), (100, 50).into());
+        add_damage(&mut damage, rect(90, 40, i32::MAX, i32::MAX), (100, 50).into());
+        add_damage(&mut damage, rect(100, 0, 5, 5), (100, 50).into());
+        add_damage(&mut damage, rect(0, 50, 5, 5), (100, 50).into());
+        assert_eq!(damage, vec![rect(10, 20, 30, 30), rect(90, 40, 10, 10)]);
+    }
+
+    #[test]
+    fn damage_past_the_cap_becomes_its_bounds() {
+        let mut damage = Vec::new();
+        for i in 0..MAX_DAMAGE_RECTS as i32 {
+            add_damage(&mut damage, rect(i * 2, i, 1, 1), (1000, 1000).into());
+        }
+        assert_eq!(damage.len(), MAX_DAMAGE_RECTS);
+        add_damage(&mut damage, rect(500, 600, 10, 10), (1000, 1000).into());
+        assert_eq!(damage, vec![rect(0, 0, 510, 610)]);
+    }
+
+    #[test]
+    fn a_flood_of_damage_stays_bounded_and_covers_every_rect() {
+        let mut damage = Vec::new();
+        let sent: Vec<_> = (0..10_000).map(|i| rect(i % 997, i % 991, 1, 1)).collect();
+        for r in &sent {
+            add_damage(&mut damage, *r, (1000, 1000).into());
+            assert!(damage.len() <= MAX_DAMAGE_RECTS);
+        }
+        for r in sent {
+            assert!(
+                Rectangle::subtract_rects_many([r], damage.iter().copied()).is_empty(),
+                "{r:?} is covered"
+            );
+        }
     }
 }
