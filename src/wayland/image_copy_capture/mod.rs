@@ -610,15 +610,32 @@ struct FrameInner {
 }
 
 impl FrameInner {
-    fn new(session_obj: ExtImageCopyCaptureSessionV1, constraints: Option<BufferConstraints>) -> Self {
+    fn new(
+        session_obj: ExtImageCopyCaptureSessionV1,
+        constraints: Option<BufferConstraints>,
+        session_stopped: bool,
+    ) -> Self {
         Self {
             constraints,
             buffer: None,
             damage: Vec::new(),
             session_obj: session_obj.downgrade(),
             capture_requested: false,
-            failed: None,
+            failed: session_stopped.then_some(FailureReason::Stopped),
             ready: false,
+        }
+    }
+
+    /// A frame that failed before `capture` (its session stopped) gets its `failed` event here:
+    /// [`FrameInner::fail`] holds the event back until capture is sent.
+    fn request_capture(&mut self) -> CaptureRequest {
+        if self.capture_requested {
+            return CaptureRequest::Repeated;
+        }
+        self.capture_requested = true;
+        match self.failed {
+            Some(reason) => CaptureRequest::Failed(reason),
+            None => CaptureRequest::Start,
         }
     }
 
@@ -631,6 +648,17 @@ impl FrameInner {
             frame.failed(reason);
         }
     }
+}
+
+/// What a `capture` request does to a frame.
+#[derive(Debug, PartialEq)]
+enum CaptureRequest {
+    /// Capture was already sent; the request is ignored.
+    Repeated,
+    /// The frame failed before capture was sent; `failed` goes out now with this reason.
+    Failed(FailureReason),
+    /// The buffer is checked and the frame goes to the compositor.
+    Start,
 }
 
 /// Rectangles a frame keeps from `damage_buffer`.
@@ -1152,8 +1180,15 @@ where
                     );
                     return;
                 }
-                let constraints = self.inner.lock().unwrap().constraints.clone();
-                let inner = Arc::new(Mutex::new(FrameInner::new(resource.clone(), constraints)));
+                let (constraints, stopped) = {
+                    let inner = self.inner.lock().unwrap();
+                    (inner.constraints.clone(), inner.stopped)
+                };
+                let inner = Arc::new(Mutex::new(FrameInner::new(
+                    resource.clone(),
+                    constraints,
+                    stopped,
+                )));
                 let obj = data_init.init(frame, FrameData { inner: inner.clone() });
                 self.inner.lock().unwrap().active_frame = Some(FrameRef { obj, inner });
             }
@@ -1200,8 +1235,15 @@ where
                     );
                     return;
                 }
-                let constraints = self.inner.lock().unwrap().constraints.clone();
-                let inner = Arc::new(Mutex::new(FrameInner::new(resource.clone(), constraints)));
+                let (constraints, stopped) = {
+                    let inner = self.inner.lock().unwrap();
+                    (inner.constraints.clone(), inner.stopped)
+                };
+                let inner = Arc::new(Mutex::new(FrameInner::new(
+                    resource.clone(),
+                    constraints,
+                    stopped,
+                )));
                 let obj = data_init.init(frame, FrameData { inner: inner.clone() });
                 self.inner.lock().unwrap().active_frame = Some(FrameRef { obj, inner });
             }
@@ -1333,10 +1375,14 @@ where
 
                 {
                     let mut inner = self.inner.lock().unwrap();
-                    if inner.capture_requested || inner.failed.is_some() {
-                        return;
+                    match inner.request_capture() {
+                        CaptureRequest::Repeated => return,
+                        CaptureRequest::Failed(reason) => {
+                            resource.failed(reason);
+                            return;
+                        }
+                        CaptureRequest::Start => {}
                     }
-                    inner.capture_requested = true;
 
                     let buffer = match inner.buffer.as_ref() {
                         Some(b) => b,
@@ -1437,8 +1483,48 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_DAMAGE_RECTS, add_damage};
+    use super::{
+        CaptureRequest, ExtImageCopyCaptureFrameV1, ExtImageCopyCaptureSessionV1, FailureReason, FrameInner,
+        MAX_DAMAGE_RECTS, add_damage,
+    };
     use crate::utils::{Buffer, Rectangle};
+    use wayland_server::{Display, Resource, backend::ObjectId};
+
+    /// An inert frame and its frame state; events sent to an inert object are dropped.
+    fn frame(session_stopped: bool) -> (ExtImageCopyCaptureFrameV1, FrameInner) {
+        let display = Display::<()>::new().unwrap();
+        let dh = display.handle();
+        let session = ExtImageCopyCaptureSessionV1::from_id(&dh, ObjectId::null()).unwrap();
+        let frame = ExtImageCopyCaptureFrameV1::from_id(&dh, ObjectId::null()).unwrap();
+        (frame, FrameInner::new(session, None, session_stopped))
+    }
+
+    #[test]
+    fn a_frame_failed_before_capture_fails_when_capture_is_sent() {
+        let (obj, mut frame) = frame(false);
+        frame.fail(&obj, FailureReason::Stopped);
+        assert_eq!(
+            frame.request_capture(),
+            CaptureRequest::Failed(FailureReason::Stopped)
+        );
+        assert_eq!(frame.request_capture(), CaptureRequest::Repeated);
+    }
+
+    #[test]
+    fn a_frame_made_on_a_stopped_session_fails_with_stopped() {
+        let (_, mut frame) = frame(true);
+        assert_eq!(
+            frame.request_capture(),
+            CaptureRequest::Failed(FailureReason::Stopped)
+        );
+    }
+
+    #[test]
+    fn a_frame_that_has_not_failed_starts_its_capture_once() {
+        let (_, mut frame) = frame(false);
+        assert_eq!(frame.request_capture(), CaptureRequest::Start);
+        assert_eq!(frame.request_capture(), CaptureRequest::Repeated);
+    }
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Buffer> {
         Rectangle::new((x, y).into(), (w, h).into())
